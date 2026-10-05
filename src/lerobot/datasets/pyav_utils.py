@@ -19,11 +19,17 @@ Centralises all :mod:`av` introspection of the bundled FFmpeg build.
 Checks degrade to a no-op when the target codec isn't available locally.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 from typing import Any
 
 import av
+try:
+    import av.option
+except (ImportError, AttributeError):
+    pass
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -70,12 +76,18 @@ def get_codec(vcodec: str) -> av.codec.Codec | None:
 
 
 @functools.cache
-def _get_codec_options_by_name(vcodec: str) -> dict[str, av.option.Option]:
+def _get_codec_options_by_name(vcodec: str) -> dict[str, Any]:
     """Private-option name → PyAV ``Option`` for *vcodec* (empty if unavailable)."""
     codec = get_codec(vcodec)
     if codec is None:
         return {}
-    return {opt.name: opt for opt in codec.descriptor.options}
+    descriptor = getattr(codec, "descriptor", None)
+    if descriptor is None:
+        return {}
+    options = getattr(descriptor, "options", None)
+    if options is None:
+        return {}
+    return {opt.name: opt for opt in options}
 
 
 @functools.cache
@@ -105,9 +117,10 @@ def detect_available_encoders_pyav(encoders: list[str] | str) -> list[str]:
     return available
 
 
-def _check_option_value(vcodec: str, label: str, value: Any, opt: av.option.Option) -> None:
+def _check_option_value(vcodec: str, label: str, value: Any, opt: Any) -> None:
     """Range-check numeric *value* and choice-check string *value* against *opt*."""
-    type_name = opt.type.name
+    opt_type = getattr(opt, "type", None)
+    type_name = getattr(opt_type, "name", str(opt_type)) if opt_type is not None else ""
     if type_name in FFMPEG_NUMERIC_OPTION_TYPES:
         if isinstance(value, bool):
             raise ValueError(
@@ -212,8 +225,8 @@ def check_video_encoder_parameters_pyav(
     Raises:
         ValueError: on the first incompatibility encountered.
     """
-    options = _get_codec_options_by_name(vcodec)
-    if not options:
+    codec = get_codec(vcodec)
+    if codec is None:
         raise ValueError(f"Codec {vcodec!r} is not available in the bundled FFmpeg build")
     _check_pixel_format(vcodec, pix_fmt)
     if channels is not None:

@@ -22,53 +22,36 @@ Evaluation runner with Decoupled 2-Axis Lock & 1D Axial Probe-Grasp Strategy
 import logging
 import torch
 
-class DecoupledAxialProbeWrapper(torch.nn.Module):
+class DecoupledAxialProbeController:
     """
     兩軸鎖定 + 單軸 Zoom In 觸碰夾取策略控制器 (Decoupled 2-Axis Lock & 1D Axial Probe-Grasp)
     
     運作程序：
     1. 粗定位階段 (Coarse Alignment)：依循 Policy 原生輸出移至目標上方。
-    2. 兩軸鎖定階段 (Lock 2 Orthogonal Axes)：當就定位時 (step >= 40)，
+    2. 兩軸鎖定階段 (Lock 2 Orthogonal Axes)：當就定位時 (step >= align_threshold_steps)，
        鎖定任兩軸 (例如水平 X, Y 軸)，強制抑制橫向漂移與抖動 (lock_damping)。
     3. 單軸 Zoom-In 探測 (1-DOF Axial Probing)：只允許深度/推進軸沿著方向向前/向下逼近。
-    4. 觸碰夾取 (Touch & Grasp)：抵達探測目標深度後 (step >= 120)，觸發夾爪強力閉合夾取或插入！
+    4. 觸碰夾取 (Touch & Grasp)：抵達探測目標深度後 (step >= auto_grasp_step)，觸發夾爪強力閉合夾取或插入！
     """
     def __init__(
         self,
-        policy,
         align_threshold_steps: int = 40,
         lock_damping: float = 0.95,
         probe_gain: float = 1.15,
         auto_grasp_step: int = 120,
-        enabled: bool = True,
     ):
-        super().__init__()
-        self.policy = policy
         self.align_threshold_steps = align_threshold_steps
         self.lock_damping = lock_damping
         self.probe_gain = probe_gain
         self.auto_grasp_step = auto_grasp_step
-        self.enabled = enabled
         self.step_counter = 0
         self.locked_state = None
-
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.policy, name)
 
     def reset(self):
         self.step_counter = 0
         self.locked_state = None
-        if hasattr(self.policy, "reset"):
-            self.policy.reset()
 
-    def select_action(self, batch):
-        action = self.policy.select_action(batch)
-        if not self.enabled:
-            return action
-
+    def apply(self, action, batch):
         self.step_counter += 1
         state = batch.get("observation.state")
         if state is None:
@@ -102,22 +85,38 @@ class DecoupledAxialProbeWrapper(torch.nn.Module):
         return action
 
 
-# 匯入官方評估腳本並套用策略包裝器
+# 匯入官方評估模組並套用策略包裝器 (保留 PreTrainedPolicy 原生型別檢查)
 import lerobot.scripts.lerobot_eval as eval_module
 
 original_make_policy = eval_module.make_policy
 
 def patched_make_policy(*args, **kwargs):
-    base_policy = original_make_policy(*args, **kwargs)
+    policy = original_make_policy(*args, **kwargs)
     logging.info("🕹️ [Strategy Engine] 已成功注入「兩軸鎖定 + 單軸 Zoom In 觸碰夾取」策略控制器！")
-    return DecoupledAxialProbeWrapper(
-        base_policy,
+    
+    controller = DecoupledAxialProbeController(
         align_threshold_steps=40,
         lock_damping=0.95,
         probe_gain=1.15,
         auto_grasp_step=120,
-        enabled=True,
     )
+    
+    orig_select_action = policy.select_action
+    orig_reset = getattr(policy, "reset", None)
+
+    def select_action_wrapper(batch):
+        action = orig_select_action(batch)
+        return controller.apply(action, batch)
+
+    def reset_wrapper():
+        controller.reset()
+        if orig_reset is not None:
+            orig_reset()
+
+    # 保留原生 PreTrainedPolicy 實例型別，動態掛載策略方法
+    policy.select_action = select_action_wrapper
+    policy.reset = reset_wrapper
+    return policy
 
 eval_module.make_policy = patched_make_policy
 

@@ -12,8 +12,19 @@
 [![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
 [![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Child-pi/lerobot/blob/main/train_smolvla_gpu_robust.ipynb)
 
 </div>
+
+## 🚀 One-Click Google Colab (SmolVLA 穩健訓練與模擬評估)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Child-pi/lerobot/blob/main/train_smolvla_gpu_robust.ipynb)
+
+專為 Google Colab (免費/付費 GPU) 設計的防斷線、防 OOM 崩潰之 SmolVLA 機器人訓練與評估筆記本：
+- 🛡️ **主動防崩潰**: 鎖定安全 Worker 與 CUDA 動態區段，杜絕 Linux OOM-Killer 靜默斷線。
+- 🛰️ **黑盒子飛行記錄器**: 背景即時監測硬體與存檔狀態，自動同步 Google Drive。
+- 🕹️ **兩軸鎖定 + 單軸 Zoom In 觸碰夾取策略**: 就定位後抑制橫向漂移，單軸精準逼近插拔/夾取。
+- 🎬 **即時評估與極速影片回放**: 自動對接 Checkpoint，Base64 嵌入式 HTML5 影片播放器。
 
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 

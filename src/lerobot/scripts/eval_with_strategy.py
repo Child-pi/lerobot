@@ -15,33 +15,12 @@
 # limitations under the License.
 
 """
-Evaluation script with Decoupled 2-Axis Lock & 1D Axial Probe-Grasp Strategy
+Evaluation runner with Decoupled 2-Axis Lock & 1D Axial Probe-Grasp Strategy
 兩軸鎖定 + 單軸 Zoom In 觸碰夾取策略評估控制器
 """
 
 import logging
-from contextlib import nullcontext
-from dataclasses import asdict
-from pathlib import Path
-from pprint import pformat
-import numpy as np
 import torch
-import draccus
-
-from lerobot.common.constants import ACTION
-from lerobot.common.datasets.factory import make_dataset
-from lerobot.common.environments.factory import make_env
-from lerobot.common.policies.factory import make_policy
-from lerobot.common.utils.random_utils import set_seed
-from lerobot.common.utils.train_utils import get_safe_torch_device
-from lerobot.configs import parser
-from lerobot.configs.eval import EvalPipelineConfig
-from lerobot.processor import (
-    make_env_pre_post_processors,
-    make_pre_post_processors,
-)
-from lerobot.scripts.lerobot_eval import eval_policy_all
-
 
 class DecoupledAxialProbeWrapper(torch.nn.Module):
     """
@@ -49,10 +28,10 @@ class DecoupledAxialProbeWrapper(torch.nn.Module):
     
     運作程序：
     1. 粗定位階段 (Coarse Alignment)：依循 Policy 原生輸出移至目標上方。
-    2. 兩軸鎖定階段 (Lock 2 Orthogonal Axes)：當就定位時，鎖定任兩軸 (例如水平 X, Y 軸)，
-       強制抑制橫向漂移與抖動 (lock_damping)。
+    2. 兩軸鎖定階段 (Lock 2 Orthogonal Axes)：當就定位時 (step >= 40)，
+       鎖定任兩軸 (例如水平 X, Y 軸)，強制抑制橫向漂移與抖動 (lock_damping)。
     3. 單軸 Zoom-In 探測 (1-DOF Axial Probing)：只允許深度/推進軸沿著方向向前/向下逼近。
-    4. 觸碰夾取 (Touch & Grasp)：抵達探測目標深度後，觸發夾爪強力閉合夾取或插入！
+    4. 觸碰夾取 (Touch & Grasp)：抵達探測目標深度後 (step >= 120)，觸發夾爪強力閉合夾取或插入！
     """
     def __init__(
         self,
@@ -73,9 +52,11 @@ class DecoupledAxialProbeWrapper(torch.nn.Module):
         self.step_counter = 0
         self.locked_state = None
 
-    @property
-    def config(self):
-        return self.policy.config
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.policy, name)
 
     def reset(self):
         self.step_counter = 0
@@ -102,7 +83,7 @@ class DecoupledAxialProbeWrapper(torch.nn.Module):
             # [0:6] 左臂 (waist, shoulder, elbow, forearm_roll, wrist_pitch, wrist_yaw), [6] 左夾爪
             # [7:13] 右臂 (waist, shoulder, elbow, forearm_roll, wrist_pitch, wrist_yaw), [13] 右夾爪
 
-            # 1. 右操作臂：鎖定 Joint 7 (腰部旋轉) 與 Joint 8 (肩部前後) -> 兩軸鎖定！
+            # 1. 右操作臂：鎖定 Joint 7 (腰部旋轉) 與 Joint 8 (肩部前後) -> 兩軸固定！
             action[:, 7] = self.locked_state[:, 7] * self.lock_damping + action[:, 7] * (1.0 - self.lock_damping)
             action[:, 8] = self.locked_state[:, 8] * self.lock_damping + action[:, 8] * (1.0 - self.lock_damping)
 
@@ -121,28 +102,15 @@ class DecoupledAxialProbeWrapper(torch.nn.Module):
         return action
 
 
-@parser.wrap()
-def main(cfg: EvalPipelineConfig) -> None:
-    logging.info(pformat(asdict(cfg)))
-    device = get_safe_torch_device(cfg.policy.device, log=True)
-    set_seed(cfg.seed)
+# 匯入官方評估腳本並套用策略包裝器
+import lerobot.scripts.lerobot_eval as eval_module
 
-    envs = make_env(
-        cfg.env,
-        n_envs=cfg.eval.batch_size,
-        use_async_envs=cfg.eval.use_async_envs,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+original_make_policy = eval_module.make_policy
 
-    base_policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
-    )
-    base_policy.eval()
-
-    # 包裹「兩軸鎖定 + 單軸 Zoom In 觸碰夾取」策略控制器
-    policy = DecoupledAxialProbeWrapper(
+def patched_make_policy(*args, **kwargs):
+    base_policy = original_make_policy(*args, **kwargs)
+    logging.info("🕹️ [Strategy Engine] 已成功注入「兩軸鎖定 + 單軸 Zoom In 觸碰夾取」策略控制器！")
+    return DecoupledAxialProbeWrapper(
         base_policy,
         align_threshold_steps=40,
         lock_damping=0.95,
@@ -151,44 +119,7 @@ def main(cfg: EvalPipelineConfig) -> None:
         enabled=True,
     )
 
-    preprocessor_overrides = {
-        "device_processor": {"device": str(policy.config.device)},
-        "rename_observations_processor": {"rename_map": cfg.rename_map},
-    }
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
-        preprocessor_overrides=preprocessor_overrides,
-    )
-
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-        env_cfg=cfg.env, policy_cfg=cfg.policy
-    )
-
-    recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
-    max_episodes_rendered = 0 if cfg.eval.recording else 10
-    videos_dir = None if cfg.eval.recording else Path(cfg.output_dir) / "videos"
-
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        info = eval_policy_all(
-            envs=envs,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            env_postprocessor=env_postprocessor,
-            n_episodes=cfg.eval.n_episodes,
-            videos_dir=videos_dir,
-            max_episodes_rendered=max_episodes_rendered,
-            start_episode_index=0,
-            recordings_dir=recording_dir,
-            return_observations=False,
-            device=device,
-        )
-
-    logging.info(f"評估結果: {info}")
-
+eval_module.make_policy = patched_make_policy
 
 if __name__ == "__main__":
-    main()
+    eval_module.eval_main()

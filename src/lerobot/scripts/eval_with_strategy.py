@@ -92,10 +92,12 @@ class DecoupledAxialProbeController:
             if self.step_counter >= self.align_threshold_steps:
                 self.is_aligned = True
             elif self.adaptive_convergence and state is not None and self.prev_state is not None:
+                # 只有在經過充分交會逼近期後才允許自適應就定位判定
                 xy_diff = torch.abs(state[..., [7, 8]] - self.prev_state[..., [7, 8]]).sum().item()
                 if xy_diff < self.convergence_delta:
                     self.stable_counter += 1
-                    if self.stable_counter >= 3 and self.step_counter >= 25:
+                    min_step = int(self.align_threshold_steps * 0.85)
+                    if self.stable_counter >= 3 and self.step_counter >= min_step:
                         self.is_aligned = True
                         logging.info(f"🎯 [Strategy] (X,Y) 自適應判定就定位 (Step {self.step_counter}, Diff: {xy_diff:.4f})")
                 else:
@@ -104,7 +106,10 @@ class DecoupledAxialProbeController:
             if state is not None:
                 self.prev_state = state.clone()
 
-        # (X,Y) 就定位後：鎖定水平多軸，開始往 Z 座標探索！
+        # (X,Y) 就定位後：鎖定水平多軸，開始往 Z 座標深入探索！
+        is_1d = (action.ndim == 1)
+        act = action.unsqueeze(0) if is_1d else action
+
         if self.is_aligned:
             if self.locked_pos is None:
                 if state is not None and hasattr(state, "shape") and state.shape[-1] >= 14:
@@ -112,12 +117,9 @@ class DecoupledAxialProbeController:
                 else:
                     self.locked_pos = action.clone()
 
-            # 確保形狀為 2D 方便切片操作
-            is_1d = (action.ndim == 1)
-            act = action.unsqueeze(0) if is_1d else action
             lock_p = self.locked_pos.unsqueeze(0) if self.locked_pos.ndim == 1 else self.locked_pos
 
-            # 1. 多軸鎖定：固定 (X,Y) 座標與防抖輔助軸
+            # 1. 多軸鎖定：固定 (X,Y) 座標與防抖輔助軸 (lock_damping)
             for axis in self.locked_axes:
                 if axis < act.shape[-1]:
                     act[:, axis] = lock_p[:, axis] * self.lock_damping + act[:, axis] * (1.0 - self.lock_damping)
@@ -127,13 +129,15 @@ class DecoupledAxialProbeController:
                 if axis < act.shape[-1]:
                     act[:, axis] = act[:, axis] * self.probe_gain
 
-            # 3. 觸碰或深入探測達到指定時機，強力觸發夾爪閉合
-            if self.step_counter >= self.auto_grasp_step:
-                act[:, 13] = torch.clamp(act[:, 13] + 0.8, 0.0, 1.0)
-                act[:, 6] = torch.clamp(act[:, 6] + 0.8, 0.0, 1.0)
+        # 3. 全程防脫落夾爪鎖緊保護 (Anti-Slip Clamp Guard):
+        # Aloha 規格 0.0 為緊閉 (Closed)，1.0 為完全張開 (Open)。
+        # 在 AlohaInsertion-v0 對接任務中，雙手預設即持有物件；夾爪張開會直接導致插頭/插座滑落。
+        # 因此全程強制將夾爪指令限縮在牢固緊閉區間 [0.0, 0.03]，杜絕滑脫。
+        if act.shape[-1] >= 14:
+            act[:, 13] = torch.clamp(act[:, 13], 0.0, 0.03)  # 右夾爪鎖死 (緊持插頭)
+            act[:, 6] = torch.clamp(act[:, 6], 0.0, 0.03)    # 左夾爪鎖死 (緊持插座)
 
-            action = act.squeeze(0) if is_1d else act
-
+        action = act.squeeze(0) if is_1d else act
         return action
 
 

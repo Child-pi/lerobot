@@ -39,33 +39,74 @@ class DecoupledAxialProbeController:
         lock_damping: float = 0.95,
         probe_gain: float = 1.15,
         auto_grasp_step: int = 120,
+        locked_axes: list = None,
+        probe_axes: list = None,
+        adaptive_convergence: bool = True,
+        convergence_delta: float = 0.015,
     ):
         self.align_threshold_steps = align_threshold_steps
         self.lock_damping = lock_damping
         self.probe_gain = probe_gain
         self.auto_grasp_step = auto_grasp_step
+        
+        # 多軸配置：
+        # Aloha 14-DOF:
+        # 左臂 [0:6], 左夾爪 [6] | 右臂 [7:13], 右夾爪 [13]
+        # 鎖定 X, Y 平面軸與姿態穩定軸 (預設 0,1 左臂, 7,8 右操作臂水平 X,Y, 10,12 手腕橫向防漂移)
+        self.locked_axes = locked_axes if locked_axes is not None else [0, 1, 7, 8, 10, 12]
+        
+        # 沿 Z 座標探索軸 (預設 9: 右肘部 Z 軸垂直深入)
+        self.probe_axes = probe_axes if probe_axes is not None else [9]
+        
+        self.adaptive_convergence = adaptive_convergence
+        self.convergence_delta = convergence_delta
+        
         self.step_counter = 0
+        self.is_aligned = False
         self.locked_pos = None
+        self.prev_state = None
+        self.stable_counter = 0
 
     def reset(self):
         self.step_counter = 0
+        self.is_aligned = False
         self.locked_pos = None
+        self.prev_state = None
+        self.stable_counter = 0
 
     def apply(self, action, batch):
         self.step_counter += 1
         action = action.clone()
 
-        # 進入就定位區域 (step >= align_threshold_steps)
-        if self.step_counter >= self.align_threshold_steps:
+        state = None
+        if isinstance(batch, dict):
+            state = batch.get("observation.state")
+            if state is None:
+                for k, v in batch.items():
+                    if "state" in k and isinstance(v, torch.Tensor):
+                        state = v
+                        break
+
+        # 檢測 (X,Y) 是否已就定位
+        if not self.is_aligned:
+            if self.step_counter >= self.align_threshold_steps:
+                self.is_aligned = True
+            elif self.adaptive_convergence and state is not None and self.prev_state is not None:
+                xy_diff = torch.abs(state[..., [7, 8]] - self.prev_state[..., [7, 8]]).sum().item()
+                if xy_diff < self.convergence_delta:
+                    self.stable_counter += 1
+                    if self.stable_counter >= 3 and self.step_counter >= 25:
+                        self.is_aligned = True
+                        logging.info(f"🎯 [Strategy] (X,Y) 自適應判定就定位 (Step {self.step_counter}, Diff: {xy_diff:.4f})")
+                else:
+                    self.stable_counter = 0
+
+            if state is not None:
+                self.prev_state = state.clone()
+
+        # (X,Y) 就定位後：鎖定水平多軸，開始往 Z 座標探索！
+        if self.is_aligned:
             if self.locked_pos is None:
-                state = None
-                if isinstance(batch, dict):
-                    state = batch.get("observation.state")
-                    if state is None:
-                        for k, v in batch.items():
-                            if "state" in k and isinstance(v, torch.Tensor):
-                                state = v
-                                break
                 if state is not None and hasattr(state, "shape") and state.shape[-1] >= 14:
                     self.locked_pos = state.to(device=action.device, dtype=action.dtype).clone()
                 else:
@@ -76,22 +117,17 @@ class DecoupledAxialProbeController:
             act = action.unsqueeze(0) if is_1d else action
             lock_p = self.locked_pos.unsqueeze(0) if self.locked_pos.ndim == 1 else self.locked_pos
 
-            # Aloha 14-DOF 動作結構：
-            # [0:6] 左臂 (waist, shoulder, elbow, forearm_roll, wrist_pitch, wrist_yaw), [6] 左夾爪
-            # [7:13] 右臂 (waist, shoulder, elbow, forearm_roll, wrist_pitch, wrist_yaw), [13] 右夾爪
+            # 1. 多軸鎖定：固定 (X,Y) 座標與防抖輔助軸
+            for axis in self.locked_axes:
+                if axis < act.shape[-1]:
+                    act[:, axis] = lock_p[:, axis] * self.lock_damping + act[:, axis] * (1.0 - self.lock_damping)
 
-            # 1. 右操作臂：鎖定 Joint 7 (腰部旋轉) 與 Joint 8 (肩部前後) -> 兩軸固定！
-            act[:, 7] = lock_p[:, 7] * self.lock_damping + act[:, 7] * (1.0 - self.lock_damping)
-            act[:, 8] = lock_p[:, 8] * self.lock_damping + act[:, 8] * (1.0 - self.lock_damping)
+            # 2. 往 Z 座標探索：放大/推進 Z 軸探索動作 (probe_gain)
+            for axis in self.probe_axes:
+                if axis < act.shape[-1]:
+                    act[:, axis] = act[:, axis] * self.probe_gain
 
-            # 2. 剩下那一軸 (Joint 9: 肘部升降/伸展) 執行單軸 Zoom In 逼近
-            act[:, 9] = act[:, 9] * self.probe_gain
-
-            # 3. 左夾持臂：同步鎖定水平兩軸防抖
-            act[:, 0] = lock_p[:, 0] * self.lock_damping + act[:, 0] * (1.0 - self.lock_damping)
-            act[:, 1] = lock_p[:, 1] * self.lock_damping + act[:, 1] * (1.0 - self.lock_damping)
-
-            # 4. 當單軸深入探測接觸 (step >= auto_grasp_step)，強力觸發夾爪閉合！
+            # 3. 觸碰或深入探測達到指定時機，強力觸發夾爪閉合
             if self.step_counter >= self.auto_grasp_step:
                 act[:, 13] = torch.clamp(act[:, 13] + 0.8, 0.0, 1.0)
                 act[:, 6] = torch.clamp(act[:, 6] + 0.8, 0.0, 1.0)
@@ -102,20 +138,45 @@ class DecoupledAxialProbeController:
 
 
 # 匯入官方評估模組並套用策略注入 (完全保留 PreTrainedPolicy 原生型別檢查)
+import os
 import lerobot.policies as policies_module
 import lerobot.scripts.lerobot_eval as eval_module
 
 original_make_policy = eval_module.make_policy
 
+def parse_int_list(val, default):
+    if not val:
+        return default
+    try:
+        return [int(x.strip()) for x in val.split(",") if x.strip()]
+    except Exception:
+        return default
+
 def patched_make_policy(*args, **kwargs):
     policy = original_make_policy(*args, **kwargs)
-    logging.info("🕹️ [Strategy Engine] 已成功注入「兩軸鎖定 + 單軸 Zoom In 觸碰夾取」策略控制器！")
+    
+    # 從環境變數動態讀取超參數配置
+    align_thresh = int(os.environ.get("STRATEGY_ALIGN_THRESHOLD_STEPS", "40"))
+    lock_damping = float(os.environ.get("STRATEGY_LOCK_DAMPING", "0.95"))
+    probe_gain = float(os.environ.get("STRATEGY_PROBE_GAIN", "1.2"))
+    auto_grasp = int(os.environ.get("STRATEGY_AUTO_GRASP_STEP", "120"))
+    locked_axes = parse_int_list(os.environ.get("STRATEGY_LOCKED_AXES"), [0, 1, 7, 8, 10, 12])
+    probe_axes = parse_int_list(os.environ.get("STRATEGY_PROBE_AXES"), [9])
+
+    logging.info("=" * 60)
+    logging.info("🕹️ [Strategy Engine] 啟用「(X,Y) 定位後 -> 往 Z 軸探索」多軸策略控制器！")
+    logging.info(f"   - (X,Y) 鎖定軸組 (Locked Axes): {locked_axes} (鎖定阻尼: {lock_damping})")
+    logging.info(f"   - Z 探索軸組 (Probe Axes): {probe_axes} (Z 探索增益: {probe_gain})")
+    logging.info(f"   - 就定位門檻: {align_thresh} 步 | 觸碰閉合步數: {auto_grasp} 步")
+    logging.info("=" * 60)
     
     controller = DecoupledAxialProbeController(
-        align_threshold_steps=40,
-        lock_damping=0.95,
-        probe_gain=1.15,
-        auto_grasp_step=120,
+        align_threshold_steps=align_thresh,
+        lock_damping=lock_damping,
+        probe_gain=probe_gain,
+        auto_grasp_step=auto_grasp,
+        locked_axes=locked_axes,
+        probe_axes=probe_axes,
     )
     
     orig_select_action = policy.select_action

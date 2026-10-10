@@ -35,10 +35,10 @@ class DecoupledAxialProbeController:
     """
     def __init__(
         self,
-        align_threshold_steps: int = 40,
-        lock_damping: float = 0.95,
-        probe_gain: float = 1.15,
-        auto_grasp_step: int = 120,
+        align_threshold_steps: int = 200,
+        lock_damping: float = 0.70,
+        probe_gain: float = 1.25,
+        auto_grasp_step: int = 200,
         locked_axes: list = None,
         probe_axes: list = None,
         adaptive_convergence: bool = True,
@@ -52,11 +52,11 @@ class DecoupledAxialProbeController:
         # 多軸配置：
         # Aloha 14-DOF:
         # 左臂 [0:6], 左夾爪 [6] | 右臂 [7:13], 右夾爪 [13]
-        # 鎖定 X, Y 平面軸與姿態穩定軸 (預設 0,1 左臂, 7,8 右操作臂水平 X,Y, 10,12 手腕橫向防漂移)
-        self.locked_axes = locked_axes if locked_axes is not None else [0, 1, 7, 8, 10, 12]
+        # 鎖定 X, Y 平面軸與姿態穩定軸 (預設 0 左臂腰, 3,4,5 左臂手腕固定插座姿態, 10,12 右臂手腕橫向防漂移)
+        self.locked_axes = locked_axes if locked_axes is not None else [0, 3, 4, 5, 10, 12]
         
-        # 沿 Z 座標探索軸 (預設 9: 右肘部 Z 軸垂直深入)
-        self.probe_axes = probe_axes if probe_axes is not None else [9]
+        # 沿 Z 座標探索軸 (預設 8,9,11: 右肩、右肘、右腕 Pitch 聯動協同向前推進深入插座)
+        self.probe_axes = probe_axes if probe_axes is not None else [8, 9, 11]
         
         self.adaptive_convergence = adaptive_convergence
         self.convergence_delta = convergence_delta
@@ -119,15 +119,17 @@ class DecoupledAxialProbeController:
 
             lock_p = self.locked_pos.unsqueeze(0) if self.locked_pos.ndim == 1 else self.locked_pos
 
-            # 1. 多軸鎖定：固定 (X,Y) 座標與防抖輔助軸 (lock_damping)
+            # 1. 多軸鎖定：固定 (X,Y) 平面與姿態穩定軸 (以就定位點 lock_p 為基準阻尼抑制漂移)
             for axis in self.locked_axes:
                 if axis < act.shape[-1]:
-                    act[:, axis] = lock_p[:, axis] * self.lock_damping + act[:, axis] * (1.0 - self.lock_damping)
+                    delta = act[:, axis] - lock_p[:, axis]
+                    act[:, axis] = lock_p[:, axis] + delta * (1.0 - self.lock_damping)
 
-            # 2. 往 Z 座標探索：放大/推進 Z 軸探索動作 (probe_gain)
+            # 2. 往 Z 座標探索：多軸協同推進 (肩8, 肘9, 腕11 聯動推進插接向量)
             for axis in self.probe_axes:
                 if axis < act.shape[-1]:
-                    act[:, axis] = act[:, axis] * self.probe_gain
+                    delta = act[:, axis] - lock_p[:, axis]
+                    act[:, axis] = lock_p[:, axis] + delta * self.probe_gain
 
         # 3. 全程防脫落夾爪鎖緊保護 (Anti-Slip Clamp Guard):
         # Aloha 規格 0.0 為緊閉 (Closed)，1.0 為完全張開 (Open)。
@@ -160,12 +162,12 @@ def patched_make_policy(*args, **kwargs):
     policy = original_make_policy(*args, **kwargs)
     
     # 從環境變數動態讀取超參數配置
-    align_thresh = int(os.environ.get("STRATEGY_ALIGN_THRESHOLD_STEPS", "40"))
-    lock_damping = float(os.environ.get("STRATEGY_LOCK_DAMPING", "0.95"))
-    probe_gain = float(os.environ.get("STRATEGY_PROBE_GAIN", "1.2"))
-    auto_grasp = int(os.environ.get("STRATEGY_AUTO_GRASP_STEP", "120"))
-    locked_axes = parse_int_list(os.environ.get("STRATEGY_LOCKED_AXES"), [0, 1, 7, 8, 10, 12])
-    probe_axes = parse_int_list(os.environ.get("STRATEGY_PROBE_AXES"), [9])
+    align_thresh = int(os.environ.get("STRATEGY_ALIGN_THRESHOLD_STEPS", "200"))
+    lock_damping = float(os.environ.get("STRATEGY_LOCK_DAMPING", "0.70"))
+    probe_gain = float(os.environ.get("STRATEGY_PROBE_GAIN", "1.25"))
+    auto_grasp = int(os.environ.get("STRATEGY_AUTO_GRASP_STEP", "200"))
+    locked_axes = parse_int_list(os.environ.get("STRATEGY_LOCKED_AXES"), [0, 3, 4, 5, 10, 12])
+    probe_axes = parse_int_list(os.environ.get("STRATEGY_PROBE_AXES"), [8, 9, 11])
 
     logging.info("=" * 60)
     logging.info("🕹️ [Strategy Engine] 啟用「(X,Y) 定位後 -> 往 Z 軸探索」多軸策略控制器！")

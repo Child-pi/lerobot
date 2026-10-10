@@ -134,12 +134,12 @@ class DecoupledAxialProbeController:
                     act[:, axis] = lock_p[:, axis] + delta * self.probe_gain
 
         # 3. 全程防脫落夾爪鎖緊保護 (Anti-Slip Clamp Guard):
-        # Aloha 規格 0.0 為緊閉 (Closed)，1.0 為完全張開 (Open)。
-        # 在 AlohaInsertion-v0 對接任務中，雙手預設即持有物件；夾爪張開會直接導致插頭/插座滑落。
-        # 因此全程強制將夾爪指令限縮在牢固緊閉區間 [0.0, 0.03]，杜絕滑脫。
+        # Aloha 規格經由 smolvla 轉換後：0.0 為完全張開 (Open)，1.0 為緊閉 (Closed)。
+        # 在 AlohaInsertion-v0 對接任務中，雙手預設即持有物件；夾爪必須保持緊閉以防滑脫。
+        # 因此全程強制將夾爪指令限縮在牢固緊閉區間 [0.90, 1.0]，杜絕滑脫。
         if act.shape[-1] >= 14:
-            act[:, 13] = torch.clamp(act[:, 13], 0.0, 0.03)  # 右夾爪鎖死 (緊持插頭)
-            act[:, 6] = torch.clamp(act[:, 6], 0.0, 0.03)    # 左夾爪鎖死 (緊持插座)
+            act[:, 13] = torch.clamp(act[:, 13], 0.90, 1.0)  # 右夾爪鎖死 (緊持插頭)
+            act[:, 6] = torch.clamp(act[:, 6], 0.90, 1.0)    # 左夾爪鎖死 (緊持插座)
 
         action = act.squeeze(0) if is_1d else act
         return action

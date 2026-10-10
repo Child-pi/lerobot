@@ -52,11 +52,11 @@ class DecoupledAxialProbeController:
         # 多軸配置：
         # Aloha 14-DOF:
         # 左臂 [0:6], 左夾爪 [6] | 右臂 [7:13], 右夾爪 [13]
-        # 鎖定 X, Y 平面軸與姿態穩定軸 (預設 0 左臂腰, 3,4,5 左臂手腕固定插座姿態, 10,12 右臂手腕橫向防漂移)
-        self.locked_axes = locked_axes if locked_axes is not None else [0, 3, 4, 5, 10, 12]
+        # 鎖定 X, Y 平面軸與姿態穩定軸 (預設 0,1 左臂腰肩, 3,4,5 左臂手腕固定插座姿態, 10,11,12 右臂手腕三軸姿態鎖定，特別固定 11 號俯仰角防止插頭上翹)
+        self.locked_axes = locked_axes if locked_axes is not None else [0, 1, 3, 4, 5, 10, 11, 12]
         
-        # 沿 Z 座標探索軸 (預設 8,9,11: 右肩、右肘、右腕 Pitch 聯動協同向前推進深入插座)
-        self.probe_axes = probe_axes if probe_axes is not None else [8, 9, 11]
+        # 沿水平插接軸深入探索 (預設 7,8,9: 右腰Yaw向內、右肩Pitch向前、右肘Pitch向前，三軸協同水平直線插入母座)
+        self.probe_axes = probe_axes if probe_axes is not None else [7, 8, 9]
         
         self.adaptive_convergence = adaptive_convergence
         self.convergence_delta = convergence_delta
@@ -123,9 +123,11 @@ class DecoupledAxialProbeController:
             for axis in self.locked_axes:
                 if axis < act.shape[-1]:
                     delta = act[:, axis] - lock_p[:, axis]
-                    act[:, axis] = lock_p[:, axis] + delta * (1.0 - self.lock_damping)
+                    # 手腕俯仰軸 (11) 特別施加高阻尼 (0.90) 確保水平水平推進、嚴防插頭上翹
+                    damping = 0.90 if axis == 11 else self.lock_damping
+                    act[:, axis] = lock_p[:, axis] + delta * (1.0 - damping)
 
-            # 2. 往 Z 座標探索：多軸協同推進 (肩8, 肘9, 腕11 聯動推進插接向量)
+            # 2. 往水平插接軸探索：多軸協同推進 (腰7, 肩8, 肘9 聯動水平直線向前插入)
             for axis in self.probe_axes:
                 if axis < act.shape[-1]:
                     delta = act[:, axis] - lock_p[:, axis]
@@ -163,11 +165,11 @@ def patched_make_policy(*args, **kwargs):
     
     # 從環境變數動態讀取超參數配置
     align_thresh = int(os.environ.get("STRATEGY_ALIGN_THRESHOLD_STEPS", "200"))
-    lock_damping = float(os.environ.get("STRATEGY_LOCK_DAMPING", "0.70"))
+    lock_damping = float(os.environ.get("STRATEGY_LOCK_DAMPING", "0.75"))
     probe_gain = float(os.environ.get("STRATEGY_PROBE_GAIN", "1.25"))
     auto_grasp = int(os.environ.get("STRATEGY_AUTO_GRASP_STEP", "200"))
-    locked_axes = parse_int_list(os.environ.get("STRATEGY_LOCKED_AXES"), [0, 3, 4, 5, 10, 12])
-    probe_axes = parse_int_list(os.environ.get("STRATEGY_PROBE_AXES"), [8, 9, 11])
+    locked_axes = parse_int_list(os.environ.get("STRATEGY_LOCKED_AXES"), [0, 1, 3, 4, 5, 10, 11, 12])
+    probe_axes = parse_int_list(os.environ.get("STRATEGY_PROBE_AXES"), [7, 8, 9])
 
     logging.info("=" * 60)
     logging.info("🕹️ [Strategy Engine] 啟用「(X,Y) 定位後 -> 往 Z 軸探索」多軸策略控制器！")

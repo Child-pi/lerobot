@@ -156,8 +156,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 params.requires_grad = False
         if self.train_expert_only:
             self.vlm.eval()
-            for params in self.vlm.parameters():
-                params.requires_grad = False
+            for name, params in self.vlm.named_parameters():
+                if not self.freeze_vision_encoder and "vision_model" in name:
+                    params.requires_grad = True
+                else:
+                    params.requires_grad = False
+            if not self.freeze_vision_encoder:
+                self.get_vlm_model().vision_model.train()
         else:
             # To avoid unused params issue with distributed training
             last_layers = [self.num_vlm_layers - 1]
